@@ -13,6 +13,7 @@ from datasets import load_dataset, concatenate_datasets
 from torch.utils.data import DataLoader, RandomSampler, DistributedSampler
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
+from peft import LoraConfig, get_peft_model, TaskType, PeftModel
 
 torch.manual_seed(0)
 if torch.cuda.is_available():
@@ -72,8 +73,12 @@ def get_run_name(train_cfg, vlm_cfg):
     vit = f"{vlm_cfg.vit_model_type.split('/')[-1]}"
     mp = f"mp{vlm_cfg.mp_pixel_shuffle_factor}"
     llm = f"{vlm_cfg.lm_model_type.split('/')[-1]}"
+    
+    lora_suffix = ""
+    if train_cfg.use_lora:
+        lora_suffix = f"_lora_r{train_cfg.lora_r}_alpha{train_cfg.lora_alpha}"
 
-    return f"nanoVLM_{vit}_{mp}_{llm}_{num_gpus}_{dataset_size}_{batch_size}_{epochs}_{learning_rate}_{date}"
+    return f"nanoVLM_{vit}_{mp}_{llm}_{num_gpus}_{dataset_size}_{batch_size}_{epochs}_{learning_rate}{lora_suffix}_{date}"
 
 def get_dataloaders(train_cfg, vlm_cfg):
     # Create datasets
@@ -160,6 +165,28 @@ def get_dataloaders(train_cfg, vlm_cfg):
 
     return train_loader, val_loader, test_loader
 
+def apply_lora_to_model(model, train_cfg):
+    if not train_cfg.use_lora:
+        return model
+    
+    lora_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        inference_mode=False,
+        r=train_cfg.lora_r,
+        lora_alpha=train_cfg.lora_alpha,
+        lora_dropout=train_cfg.lora_dropout,
+        target_modules=train_cfg.lora_target_modules,
+        bias="none",
+        use_rslora=train_cfg.use_rslora,
+    )
+    
+    model = get_peft_model(model, lora_config)
+    
+    if is_master():
+        model.print_trainable_parameters()
+    
+    return model
+
 def test_mmstar(model, tokenizer, test_loader, device):
     total_examples = 0
     correct_predictions = 0
@@ -220,12 +247,26 @@ def train(train_cfg, vlm_cfg):
 
     # Initialize model
     if train_cfg.resume_from_vlm_checkpoint:
-        model = VisionLanguageModel.from_pretrained(vlm_cfg.vlm_checkpoint_path)
+        if train_cfg.use_lora and train_cfg.resume_from_lora_checkpoint:
+            base_model = VisionLanguageModel.from_pretrained(vlm_cfg.vlm_checkpoint_path)
+            model = PeftModel.from_pretrained(base_model, train_cfg.lora_checkpoint_path)
+        else:
+            model = VisionLanguageModel.from_pretrained(vlm_cfg.vlm_checkpoint_path)
+            if train_cfg.use_lora:
+                model = apply_lora_to_model(model, train_cfg)
     else:
         model = VisionLanguageModel(vlm_cfg, load_backbone=vlm_cfg.vlm_load_backbone_weights)
+        if train_cfg.use_lora:
+            model = apply_lora_to_model(model, train_cfg)
     
     if is_master():
-        print(f"nanoVLM initialized with {sum(p.numel() for p in model.parameters()):,} parameters") 
+        if train_cfg.use_lora:
+            print(f"nanoVLM with LoRA initialized")
+            if hasattr(model, 'print_trainable_parameters'):
+                model.print_trainable_parameters()
+        else:
+            print(f"nanoVLM initialized with {sum(p.numel() for p in model.parameters()):,} parameters")
+        
         print(f"Training summary{' (global)' if is_dist() else ''}: {len(train_loader.dataset)} samples, {int(len(train_loader)*get_world_size())} batches/epoch, batch size {int(train_cfg.batch_size*get_world_size()*train_cfg.gradient_accumulation_steps)}{', training on ' + str(get_world_size()) + ' GPUs' if is_dist() else ''}")
         if is_dist():
             print(f"Training summary per GPU: {len(train_loader)} batches/epoch, batch size {train_loader.batch_size}")
@@ -236,8 +277,23 @@ def train(train_cfg, vlm_cfg):
     # Define optimizer groups
     # Since we have pretrained vision and language backbones, but a newly initialized modality projection layer, it doesn't make sense to train them with the same learning rate
     # You could opt to fully freeze the backbones and only train the MP layer, but finetuning them with a lower learning rate makes the training as a whole easier
-    param_groups = [{'params': list(model.MP.parameters()), 'lr': train_cfg.lr_mp},
-                    {'params': list(model.decoder.parameters()) + list(model.vision_encoder.parameters()), 'lr': train_cfg.lr_backbones}]
+    if train_cfg.use_lora:
+        lora_params = [p for n, p in model.named_parameters() if 'lora_' in n]
+        mp_params = [p for n, p in model.named_parameters() if 'MP' in n and 'lora_' not in n]
+        
+        param_groups = []
+        if mp_params:
+            param_groups.append({'params': mp_params, 'lr': train_cfg.lr_mp})
+        if lora_params:
+            param_groups.append({'params': lora_params, 'lr': train_cfg.lora_lr})
+        
+        if not param_groups:
+            trainable_params = [p for p in model.parameters() if p.requires_grad]
+            param_groups = [{'params': trainable_params, 'lr': train_cfg.lora_lr}]
+    else:
+        param_groups = [{'params': list(model.MP.parameters()), 'lr': train_cfg.lr_mp},
+                        {'params': list(model.decoder.parameters()) + list(model.vision_encoder.parameters()), 'lr': train_cfg.lr_backbones}]
+    
     optimizer = optim.AdamW(param_groups)
     all_params = [p for group in optimizer.param_groups for p in group['params']]
 
@@ -305,10 +361,18 @@ def train(train_cfg, vlm_cfg):
                 if train_cfg.max_grad_norm is not None:
                     grad_norm = torch.nn.utils.clip_grad_norm_(all_params, max_norm=train_cfg.max_grad_norm)
 
-                adj_lr_mp = get_lr(global_step, train_cfg.lr_mp, len(train_loader) * train_cfg.epochs // train_cfg.gradient_accumulation_steps)
-                adj_lr_backbones = get_lr(global_step, train_cfg.lr_backbones, len(train_loader) * train_cfg.epochs // train_cfg.gradient_accumulation_steps)
-                optimizer.param_groups[0]['lr'] = adj_lr_mp
-                optimizer.param_groups[1]['lr'] = adj_lr_backbones
+                if train_cfg.use_lora:
+                    for i, group in enumerate(optimizer.param_groups):
+                        if i == 0 and len(optimizer.param_groups) > 1:
+                            group['lr'] = get_lr(global_step, train_cfg.lr_mp, len(train_loader) * train_cfg.epochs // train_cfg.gradient_accumulation_steps)
+                        else:  # LoRA
+                            group['lr'] = get_lr(global_step, train_cfg.lora_lr, len(train_loader) * train_cfg.epochs // train_cfg.gradient_accumulation_steps)
+                else:
+                    adj_lr_mp = get_lr(global_step, train_cfg.lr_mp, len(train_loader) * train_cfg.epochs // train_cfg.gradient_accumulation_steps)
+                    adj_lr_backbones = get_lr(global_step, train_cfg.lr_backbones, len(train_loader) * train_cfg.epochs // train_cfg.gradient_accumulation_steps)
+                    optimizer.param_groups[0]['lr'] = adj_lr_mp
+                    optimizer.param_groups[1]['lr'] = adj_lr_backbones
+
                 optimizer.step()
                 optimizer.zero_grad()
 
@@ -377,7 +441,10 @@ def train(train_cfg, vlm_cfg):
                             best_accuracy = epoch_accuracy
                             save = True
                         if save:
-                            eval_model.save_pretrained(save_directory=os.path.join(vlm_cfg.vlm_checkpoint_path, run_name))
+                            if train_cfg.use_lora:
+                                eval_model.save_pretrained(os.path.join(vlm_cfg.vlm_checkpoint_path, run_name))
+                            else:
+                                eval_model.save_pretrained(save_directory=os.path.join(vlm_cfg.vlm_checkpoint_path, run_name))
                         
                         if train_cfg.log_wandb and is_master():    
                             run.log({"accuracy": epoch_accuracy, **lmms_results}, step=global_step)
@@ -429,8 +496,13 @@ def train(train_cfg, vlm_cfg):
         # Push the best model to the hub (Please set your user name in the config!)
         if vlm_cfg.hf_repo_name is not None:
             print("Training complete. Pushing model to Hugging Face Hub...")
-            hf_model = VisionLanguageModel.from_pretrained(os.path.join(vlm_cfg.vlm_checkpoint_path, run_name))
-            hf_model.push_to_hub(vlm_cfg.hf_repo_name)
+            if train_cfg.use_lora:
+                base_model = VisionLanguageModel.from_pretrained(vlm_cfg.vlm_checkpoint_path)
+                hf_model = PeftModel.from_pretrained(base_model, os.path.join(vlm_cfg.vlm_checkpoint_path, run_name))
+                hf_model.push_to_hub(vlm_cfg.hf_repo_name)
+            else:
+                hf_model = VisionLanguageModel.from_pretrained(os.path.join(vlm_cfg.vlm_checkpoint_path, run_name))
+                hf_model.push_to_hub(vlm_cfg.hf_repo_name)
 
         if train_cfg.log_wandb:
             run.summary["avg_epoch_time"] = avg_epoch_time
@@ -446,6 +518,14 @@ def main():
     parser.add_argument('--compile', type=bool, help='Use torch.compile to optimize the model')
     parser.add_argument('--log_wandb', type=bool, help='Log to wandb')
     parser.add_argument('--resume_from_vlm_checkpoint', type=bool, default=False, help='Resume training from VLM checkpoint specified by vlm_checkpoint_path (or default if not provided)')
+    
+    parser.add_argument('--use_lora', type=bool, default=False, help='Use LoRA for parameter-efficient fine-tuning')
+    parser.add_argument('--lora_r', type=int, default=16, help='LoRA rank')
+    parser.add_argument('--lora_alpha', type=int, default=32, help='LoRA alpha parameter')
+    parser.add_argument('--lora_dropout', type=float, default=0.1, help='LoRA dropout')
+    parser.add_argument('--lora_lr', type=float, default=1e-4, help='Learning rate for LoRA parameters')
+    parser.add_argument('--resume_from_lora_checkpoint', type=bool, default=False, help='Resume from LoRA checkpoint')
+    parser.add_argument('--lora_checkpoint_path', type=str, help='Path to LoRA checkpoint')
 
     args = parser.parse_args()
 
@@ -462,6 +542,21 @@ def main():
         train_cfg.compile = args.compile
     if args.log_wandb is not None:
         train_cfg.log_wandb = args.log_wandb
+    
+    if args.use_lora is not None:
+        train_cfg.use_lora = args.use_lora
+    if args.lora_r is not None:
+        train_cfg.lora_r = args.lora_r
+    if args.lora_alpha is not None:
+        train_cfg.lora_alpha = args.lora_alpha
+    if args.lora_dropout is not None:
+        train_cfg.lora_dropout = args.lora_dropout
+    if args.lora_lr is not None:
+        train_cfg.lora_lr = args.lora_lr
+    if args.resume_from_lora_checkpoint is not None:
+        train_cfg.resume_from_lora_checkpoint = args.resume_from_lora_checkpoint
+    if args.lora_checkpoint_path is not None:
+        train_cfg.lora_checkpoint_path = args.lora_checkpoint_path
 
     if args.resume_from_vlm_checkpoint and args.vlm_checkpoint_path is not None:
         train_cfg.resume_from_vlm_checkpoint = True
